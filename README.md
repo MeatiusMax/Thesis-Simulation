@@ -1,3 +1,3 @@
 # Thesis-Simulation
 
-istall the requiremtns first
+install the requiremtns first
