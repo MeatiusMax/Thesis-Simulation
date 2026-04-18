@@ -78,6 +78,7 @@ def run_simulation():
         num_staff = data.get('num_staff', 6)
         quota_limit = data.get('quota_limit', 20)
         num_requests = data.get('num_requests', 80)  # Not directly used yet, needs override in engine
+        random_seed = data.get('random_seed')
         
         # Validate inputs
         if scheduler_type not in ['FCFS', 'WEIGHTED']:
@@ -96,11 +97,14 @@ def run_simulation():
             staff_config={
                 "num_staff": num_staff,
                 "quota_limit": quota_limit
-            }
+            },
+            random_seed=random_seed,
         )
         
-        results = engine.run(scenario=scenario)
-        
+        results = engine.run(custom_config={
+            "scenario": scenario,
+            "total_requests": num_requests,
+            })
         # Return results with additional metadata
         return jsonify({
             "success": True,
@@ -109,7 +113,8 @@ def run_simulation():
                 "allocator_type": allocator_type,
                 "scenario": scenario,
                 "num_staff": num_staff,
-                "quota_limit": quota_limit
+                "quota_limit": quota_limit,
+                "random_seed": results.get("seed_used"),
             },
             "results": results,
             "completed_requests": len(engine.completed),
@@ -132,11 +137,12 @@ def run_quick_simulation():
     """
     try:
         data = request.get_json() or {}
-        
+        random_seed = data.get('random_seed')
         engine = SimulationEngine(
             scheduler_type='FCFS',
             allocator_type='college_based',
-            staff_config={"num_staff": 6, "quota_limit": 20}
+            staff_config={"num_staff": 6, "quota_limit": 20},
+            random_seed=random_seed
         )
         
         results = engine.run(scenario='baseline')
@@ -167,7 +173,7 @@ def compare_allocators():
     """
     try:
         data = request.get_json() or {}
-        
+        random_seed = data.get('random_seed')
         scenario = data.get('scenario', 'baseline')
         num_staff = data.get('num_staff', 6)
         quota_limit = data.get('quota_limit', 20)
@@ -179,7 +185,8 @@ def compare_allocators():
             engine = SimulationEngine(
                 scheduler_type='FCFS',
                 allocator_type=allocator,
-                staff_config={"num_staff": num_staff, "quota_limit": quota_limit}
+                staff_config={"num_staff": num_staff, "quota_limit": quota_limit},
+                random_seed=random_seed
             )
             
             sim_results = engine.run(scenario=scenario)

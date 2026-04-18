@@ -91,6 +91,18 @@ quota_limit = st.sidebar.slider(
     help="Max requests per staff per day"
 )
 
+st.sidebar.subheader("Reproducibility")
+seed_mode = st.sidebar.radio("Seed Mode", ["Auto", "Manual"], index=0)
+if seed_mode == "Manual":
+    manual_seed = st.sidebar.number_input(
+        "Random Seed", 
+        min_value=1, 
+        max_value=2_147_483_647, 
+        value=12345
+    )
+else:
+    manual_seed = None
+
 # ============================================================================
 # RUN SIMULATION
 # ============================================================================
@@ -122,13 +134,17 @@ if st.sidebar.button("🚀 RUN SIMULATION", use_container_width=True):
                 "enable_custom_staff": True,
                 "num_staff": effective_staff,  
                 "quota_limit": quota_limit
-            }
+            },
+            random_seed=manual_seed
         )
         results = engine.run(custom_config=custom_config) 
         
         # Store in session state (persists across interactions)
         st.session_state.simulation_engine = engine
         st.session_state.simulation_results = results
+
+        if 'seed_used' in results:
+            st.sidebar.success(f"✅ Run complete (Seed: {results['seed_used']})")
 
 # ============================================================================
 # DISPLAY RESULTS
@@ -185,6 +201,118 @@ if st.session_state.simulation_results and st.session_state.simulation_engine:
             f"{results['throughput_req_per_day']:.2f}",
             help="Requests per day"
         )
+
+    # ========================================================================
+    # EVENT LOG VISUALIZATION
+    # ========================================================================
+    
+    st.header("📋 Event Log")
+    
+    event_log = results.get("event_log", [])
+    
+    if event_log:
+        # Filter controls
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            filter_event_type = st.multiselect(
+                "Event Type",
+                options=["ARRIVAL", "ASSIGN", "COMPLETE", "WAITING"],
+                default=["ARRIVAL", "ASSIGN", "COMPLETE", "WAITING"],
+                key="filter_event_type"
+            )
+        with col2:
+            filter_college = st.multiselect(
+                "College",
+                options=["All"] + COLLEGES,
+                default=["All"],
+                key="filter_college_events"
+            )
+        with col3:
+            max_events = st.slider(
+                "Max Events to Show", 
+                min_value=10, 
+                max_value=len(event_log), 
+                value=min(100, len(event_log)), 
+                key="max_events"
+            )
+        
+        # Filter events
+        filtered_events = [
+            ev for ev in event_log 
+            if ev.get("event_type") in filter_event_type
+            and (filter_college == ["All"] or ev.get("college") in filter_college)
+        ][:max_events]
+        
+        # Convert to DataFrame
+        if filtered_events:
+            event_df = pd.DataFrame(filtered_events)
+            
+            # Format time column for display
+            event_df["Time"] = pd.to_datetime(event_df["time"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Select and rename columns for clean display
+            display_cols = ["sequence", "Time", "event_type", "request_id", "college", "staff_id", "details"]
+            if all(col in event_df.columns for col in display_cols):
+                display_df = event_df[display_cols].copy()
+                display_df.columns = ["#", "Time", "Event Type", "Request ID", "College", "Staff", "Details"]
+                
+                # Color code by event type for better readability
+                def color_event_type(val):
+                    colors = {
+                        "ARRIVAL": "#e3f2fd",    # Light blue
+                        "ASSIGN": "#c8e6c9",     # Light green
+                        "COMPLETE": "#a5d6a7",   # Green
+                        "WAITING": "#ffebee"     # Light red
+                    }
+                    return f"background-color: {colors.get(val, 'white')}"
+                
+                st.dataframe(
+                    display_df.style.applymap(color_event_type, subset=["Event Type"]),
+                    use_container_width=True,
+                    hide_index=True
+                )
+                
+                # Event statistics summary
+                st.subheader("📊 Event Statistics")
+                stats_col1, stats_col2, stats_col3, stats_col4 = st.columns(4)
+                
+                event_counts = display_df["Event Type"].value_counts()
+                
+                with stats_col1:
+                    st.metric("Total Events", len(display_df))
+                with stats_col2:
+                    st.metric("Arrivals", event_counts.get("ARRIVAL", 0))
+                with stats_col3:
+                    st.metric("Assignments", event_counts.get("ASSIGN", 0))
+                with stats_col4:
+                    st.metric("Waiting (Unassigned)", event_counts.get("WAITING", 0))
+                
+                # Timeline chart: Events by hour
+                st.subheader("📈 Event Timeline")
+                if "Time" in event_df.columns:
+                    timeline_df = event_df.copy()
+                    timeline_df["Hour"] = pd.to_datetime(timeline_df["Time"]).dt.hour
+                    
+                    fig_timeline = px.histogram(
+                        timeline_df,
+                        x="Hour",
+                        color="Event Type",
+                        title="Events by Hour of Simulation Day",
+                        labels={"Hour": "Hour of Day (8 AM = 8, 5 PM = 17)", "count": "Number of Events"},
+                        color_discrete_map={
+                            "ARRIVAL": "#2196f3",
+                            "ASSIGN": "#4caf50",
+                            "COMPLETE": "#8bc34a",
+                            "WAITING": "#f44336"
+                        },
+                        nbins=24
+                    )
+                    fig_timeline.update_layout(xaxis=dict(tickmode='linear', tick0=8, dtick=1))
+                    st.plotly_chart(fig_timeline, use_container_width=True)
+        else:
+            st.info("No events match the selected filters.")
+    else:
+        st.warning("No event log available. Ensure your backend returns 'event_log' in results.")
     
     # ========================================================================
     # ABSENT STAFF SECTION
@@ -217,6 +345,58 @@ if st.session_state.simulation_results and st.session_state.simulation_engine:
         
         waiting_df = pd.DataFrame(waiting_data)
         st.dataframe(waiting_df, use_container_width=True, hide_index=True)
+
+    
+    # ========================================================================
+    # QUEUE WAIT ANALYSIS
+    # ========================================================================
+    
+    st.header("⏱️ Queue Wait Analysis")
+    
+    if event_log:
+        # Extract assignment events with queue wait info
+        assign_events = [ev for ev in event_log if ev.get("event_type") == "ASSIGN" and ev.get("queue_wait_hours") is not None]
+        
+        if assign_events:
+            wait_data = []
+            for ev in assign_events:
+                wait_data.append({
+                    "Request ID": ev.get("request_id"),
+                    "College": ev.get("college"),
+                    "Staff": ev.get("staff_id"),
+                    "Queue Wait (h)": ev.get("queue_wait_hours", 0),
+                    "Processing Hours": ev.get("processing_hours", 0),
+                    "Time": ev.get("time")
+                })
+            
+            wait_df = pd.DataFrame(wait_data)
+            
+            # Summary statistics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Avg Queue Wait", f"{wait_df['Queue Wait (h)'].mean():.2f} h")
+            with col2:
+                st.metric("Max Queue Wait", f"{wait_df['Queue Wait (h)'].max():.2f} h")
+            with col3:
+                st.metric("Min Queue Wait", f"{wait_df['Queue Wait (h)'].min():.2f} h")
+            with col4:
+                st.metric("Requests with >24h Wait", len(wait_df[wait_df["Queue Wait (h)"] > 24]))
+            
+            # Distribution chart
+            fig_wait = px.histogram(
+                wait_df,
+                x="Queue Wait (h)",
+                nbins=30,
+                title="Distribution of Queue Wait Times",
+                labels={"Queue Wait (h)": "Queue Wait (hours)"},
+                color_discrete_sequence=["#ff9800"]
+            )
+            st.plotly_chart(fig_wait, use_container_width=True)
+            
+            # Show requests with longest waits
+            st.subheader("🔴 Longest Queue Waits (Top 10)")
+            longest_waits = wait_df.nlargest(10, "Queue Wait (h)")
+            st.dataframe(longest_waits, use_container_width=True, hide_index=True)
     
     # ========================================================================
     # STAFF LOAD DISTRIBUTION (Bar Chart)

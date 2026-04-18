@@ -27,3 +27,4 @@ print('\nStaff Load Distribution:')
 for staff_id, load in results['staff_load'].items():
     print(f'  {staff_id}: {load} requests')
 print('='*70)
+
