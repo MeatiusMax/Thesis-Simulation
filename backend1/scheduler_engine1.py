@@ -1004,7 +1004,7 @@ class SimulationEngine:
                 earliest,
                 enforce_quota=False,
                 exact_time=exact_time,
-                ignore_staff_availability=False,
+                ignore_staff_availability=True,
             )
             chosen = self._select_from_options(options, mode="earliest")
             if not chosen:
