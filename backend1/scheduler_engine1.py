@@ -1151,8 +1151,11 @@ class SimulationEngine:
         staff.total_assigned += 1
         staff.increment_day_quota(assignment_time.date())
 
-        # Staff become available after completing the current request
-        staff.next_available_time = completion_time
+        # Assignment availability is not completion-blocked in current intake model.
+        if self.allocator_type == "quota_free":
+            staff.next_available_time = completion_time
+        else:
+            staff.next_available_time = assignment_time
 
         self.completed.append(request)
 
