@@ -134,9 +134,9 @@ COMPLETENESS_LEVELS = {
     "partial": 0.7,
     "complete": 1.0,
 }
-REQUIREMENTS_PARTIAL_DELAY_HOURS_RANGE = (0.0, 0.2) # up to 12 minutes for partial requirements
+REQUIREMENTS_PARTIAL_DELAY_HOURS_RANGE = (0.0, 0.1) # up to 12 minutes for partial requirements
 REQUIREMENTS_COMPLETE_EXTRA_DELAY_HOURS_RANGE = (0.0, 1.0) # up to 1 hour after partial for complete requirements
-PAYMENT_DELAY_HOURS_RANGE = (0.0, 48.0) # up to 2 days for payment after submission (if required)
+PAYMENT_DELAY_HOURS_RANGE = (0.0, 0.1) # up to 2 days for payment after submission (if required)
 
 
 def _build_college_priority() -> Dict[str, float]:
@@ -1247,7 +1247,6 @@ class SimulationEngine:
 
             staff, assignment_time, mode = selected
             self._assign_request(next_req, staff, assignment_time, mode)
-            current_time = max(current_time, assignment_time)
 
     def _run_weighted(self, requests: List[DocumentRequest]):
         arrivals = sorted(requests, key=lambda r: r.submission_time)
@@ -1319,7 +1318,7 @@ class SimulationEngine:
 
             # Pick highest-priority request that is assignable right now.
             for req in ranked:
-                candidate = self._select_assignment(req, reference_time=current_time, exact_time=current_time)
+                candidate = self._select_assignment(req, reference_time=current_time)
                 if candidate is None:
                     continue
                 staff, assignment_time, mode = candidate
