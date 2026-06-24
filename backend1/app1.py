@@ -69,8 +69,13 @@ app.json.default = to_json_serializable
 
 def get_staff_info(engine):
     return [{
-        "staff_id": s.staff_id, "name": s.name, 
-        "college_affiliation": s.college_affiliation, "quota_limit": s.quota_limit
+        "staff_id": s.staff_id,
+        "name": s.name,
+        "college_affiliation": s.college_affiliation,
+        "quota_limit": s.quota_limit,
+        "is_available": s.is_available,
+        "is_absent": not s.is_available,
+        "total_assigned": s.total_assigned,
     } for s in engine.staff_pool]
 
 # ============================================================================
@@ -132,8 +137,7 @@ def run_simulation():
     """
     try:
         data = request.get_json() or {}
-        
-        # Extract parameters with defaults
+
         scheduler_type = data.get('scheduler_type', 'FCFS')
         allocator_type = data.get('allocator_type', 'college_based')
         scenario = data.get('scenario', 'baseline')
@@ -143,30 +147,38 @@ def run_simulation():
         urgency_base = data.get('urgency_base', 5)
         imbalance_factor = data.get('imbalance_factor', 0)
         num_absent_staff = data.get('num_absent_staff', 0)
+
+        absent_staff_ids = data.get("absent_staff_ids", [])
+        if isinstance(absent_staff_ids, str):
+            absent_staff_ids = [absent_staff_ids]
+        absent_staff_ids = [
+            str(x).strip()
+            for x in absent_staff_ids
+            if str(x).strip()
+        ]
+
         random_seed = data.get('random_seed')
         work_start = data.get('work_start', '08:00')
         work_end = data.get('work_end', '17:00')
         priority_weights = data.get('priority_weights')
         urgency = data.get('urgency', False)
         disable_generated_requests = data.get('disable_generated_requests', False)
-        
-        # Validate inputs
+
         if scheduler_type not in ['FCFS', 'WEIGHTED']:
             return jsonify({"error": f"Invalid scheduler_type: {scheduler_type}"}), 400
-        
+
         if allocator_type not in ['college_based', 'workload_based', 'pooled', 'quota_free']:
             return jsonify({"error": f"Invalid allocator_type: {allocator_type}"}), 400
-        
-        if scenario not in ['baseline', 'staff_absence', 'peak_urgency', 'workload_imbalance','peak_period']:
+
+        if scenario not in ['baseline', 'staff_absence', 'peak_urgency', 'workload_imbalance', 'peak_period']:
             return jsonify({"error": f"Invalid scenario: {scenario}"}), 400
-        
-        # Create and run simulation
+
         engine = SimulationEngine(
             scheduler_type=scheduler_type,
             allocator_type=allocator_type,
             staff_config={
                 "num_staff": num_staff,
-                "quota_limit": quota_limit
+                "quota_limit": quota_limit,
             },
             priority_weights=priority_weights,
             random_seed=random_seed,
@@ -181,6 +193,7 @@ def run_simulation():
             "urgency_base": urgency_base,
             "imbalance_factor": imbalance_factor,
             "num_absent_staff": num_absent_staff,
+            "absent_staff_ids": absent_staff_ids,
             "disable_generated_requests": disable_generated_requests,
             "sim_start_date": data.get("sim_start_date"),
             "align_custom_dates": data.get("align_custom_dates", False),
@@ -191,8 +204,7 @@ def run_simulation():
         })
 
         staff_info = get_staff_info(engine)
-        
-        # Return results with additional metadata
+
         return jsonify({
             "success": True,
             "parameters": {
@@ -205,15 +217,16 @@ def run_simulation():
                 "urgency_base": urgency_base,
                 "imbalance_factor": imbalance_factor,
                 "num_absent_staff": num_absent_staff,
+                "absent_staff_ids": absent_staff_ids,
                 "random_seed": results.get("seed_used"),
                 "work_start": work_start,
                 "work_end": work_end,
             },
             "results": {**results, "staff_info": staff_info},
             "completed_requests": len(engine.completed),
-            "staff_load": results['staff_load']
+            "staff_load": results["staff_load"],
         }), 200
-        
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -282,6 +295,10 @@ def compare_allocators():
         urgency_base = data.get('urgency_base', 5)
         imbalance_factor = data.get('imbalance_factor', 0)
         num_absent_staff = data.get('num_absent_staff', 0)
+        absent_staff_ids = data.get('absent_staff_ids', [])
+        if isinstance(absent_staff_ids, str):
+            absent_staff_ids = [absent_staff_ids]
+        absent_staff_ids = [str(x).strip() for x in absent_staff_ids if str(x).strip()]
         random_seed = data.get('random_seed', 12345)
         work_start = data.get('work_start', '08:00')
         work_end = data.get('work_end', '17:00')
@@ -309,8 +326,13 @@ def compare_allocators():
                 "total_requests": total_requests,
                 "urgency_base": urgency_base,
                 "imbalance_factor": imbalance_factor,
+
+                # absence config
                 "num_absent_staff": num_absent_staff,
+                "absent_staff_ids": absent_staff_ids,
+
                 "disable_generated_requests": disable_generated_requests,
+
                 "sim_start_date": data.get("sim_start_date"),
                 "align_custom_dates": data.get("align_custom_dates", False),
                 "custom_requests": data.get("custom_requests"),

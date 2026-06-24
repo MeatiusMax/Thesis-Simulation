@@ -649,12 +649,21 @@ class SimulationEngine:
         merged["scenario"] = scenario
         merged["align_custom_dates"] = bool(incoming.get("align_custom_dates", False))
         merged["custom_requests"] = incoming.get("custom_requests", None)
-        
-        # Parse simulation start date if configured
+
+        absent_staff_ids = incoming.get("absent_staff_ids", [])
+        if isinstance(absent_staff_ids, str):
+            absent_staff_ids = [absent_staff_ids]
+
+        merged["absent_staff_ids"] = [
+            str(x).strip()
+            for x in absent_staff_ids
+            if str(x).strip()
+        ]
+
         sim_start_str = incoming.get("sim_start_date")
         if sim_start_str:
             try:
-                if 'T' in sim_start_str:
+                if "T" in sim_start_str:
                     merged["sim_start_date"] = datetime.fromisoformat(sim_start_str).date()
                 else:
                     merged["sim_start_date"] = datetime.strptime(sim_start_str.strip(), "%Y-%m-%d").date()
@@ -662,10 +671,27 @@ class SimulationEngine:
                 merged["sim_start_date"] = datetime.now().date()
         else:
             merged["sim_start_date"] = datetime.now().date()
-            
+
         return merged
 
-    def _apply_staff_absence(self, num_absent_staff: int):
+    def _apply_staff_absence(self, num_absent_staff: int, absent_staff_ids: Optional[List[str]] = None):
+        absent_staff_ids = absent_staff_ids or []
+
+        if absent_staff_ids:
+            target_ids = {
+                str(staff_id).strip()
+                for staff_id in absent_staff_ids
+                if str(staff_id).strip()
+            }
+
+            for staff in self.staff_pool:
+                if staff.staff_id in target_ids:
+                    staff.is_available = False
+                    if staff.staff_id not in self.absent_staff_ids:
+                        self.absent_staff_ids.append(staff.staff_id)
+
+            return
+
         if num_absent_staff <= 0:
             return
 
@@ -678,7 +704,8 @@ class SimulationEngine:
 
         for staff in absent_staff:
             staff.is_available = False
-            self.absent_staff_ids.append(staff.staff_id)
+            if staff.staff_id not in self.absent_staff_ids:
+                self.absent_staff_ids.append(staff.staff_id)
 
     def _generate_requests(self, config: Dict) -> List[DocumentRequest]:
         total_requests = int(config["total_requests"])
@@ -1020,13 +1047,14 @@ class SimulationEngine:
 
     def _finalize_event_log(self):
         priority = {
-            "ARRIVAL": 0,
-            "PRIORITY": 1,
-            "ASSIGN": 2,
-            "WAITING": 3,
-            "COMPLETE": 4,
-            "INFO": 5,
-        }
+        "ARRIVAL": 0,
+        "PRIORITY": 1,
+        "QUEUE": 2,
+        "ASSIGN": 3,
+        "WAITING": 4,
+        "COMPLETE": 5,
+        "INFO": 6,
+    }
         self.event_log.sort(
             key=lambda ev: (
                 ev["time"],
@@ -1065,10 +1093,57 @@ class SimulationEngine:
         assignment_time: datetime,
         assignment_mode: str,
     ):
+        if not staff.is_available:
+            raise RuntimeError(
+                f"Attempted to assign {request.request_id} to absent staff {staff.staff_id}"
+            )
+
         request.update_status(assignment_time)
+
+        if not self._is_request_ready(request, assignment_time):
+            raise RuntimeError(
+                f"Attempted to assign {request.request_id} before requirements/payment readiness"
+            )
+
+        queue_start_time = request.ready_time or request.submission_time
+        queue_start_time = self._next_working_start(queue_start_time)
+
+        quota_waiting = False
+
+        if self.allocator_type != "quota_free":
+            queue_day = queue_start_time.date()
+            assignment_day = assignment_time.date()
+
+            assigned_on_queue_day = staff.assignments_on_day(queue_day)
+
+            quota_waiting = (
+                assignment_day > queue_day
+                or assigned_on_queue_day >= staff.quota_limit
+            )
+
+        if quota_waiting:
+            self._log_event(
+                queue_start_time,
+                "QUEUE",
+                request=request,
+                staff=staff,
+                details="quota_or_slot_waiting",
+                extra={
+                    "assigned_at": assignment_time.isoformat(),
+                    "queue_wait_hours": round(
+                        (assignment_time - queue_start_time).total_seconds() / 3600.0,
+                        2,
+                    ),
+                },
+            )
+
         processing_duration, use_work_hours = self._processing_duration(request)
+
         if use_work_hours:
-            completion_time = self._add_processing_with_work_hours(assignment_time, processing_duration)
+            completion_time = self._add_processing_with_work_hours(
+                assignment_time,
+                processing_duration,
+            )
         else:
             completion_time = assignment_time + processing_duration
 
@@ -1079,7 +1154,6 @@ class SimulationEngine:
         staff.total_assigned += 1
         staff.increment_day_quota(assignment_time.date())
 
-        # Assignment availability is not completion-blocked in current intake model.
         if self.allocator_type == "quota_free":
             staff.next_available_time = completion_time
         else:
@@ -1088,6 +1162,7 @@ class SimulationEngine:
         self.completed.append(request)
 
         wait_hours = (assignment_time - request.submission_time).total_seconds() / 3600.0
+
         self._log_event(
             assignment_time,
             "ASSIGN",
@@ -1099,6 +1174,7 @@ class SimulationEngine:
                 "processing_hours": round(processing_duration.total_seconds() / 3600.0, 2),
             },
         )
+
         self._log_event(
             completion_time,
             "COMPLETE",
@@ -1106,6 +1182,8 @@ class SimulationEngine:
             staff=staff,
             details="request_completed",
         )
+
+        return completion_time
 
     # ---------------------------------------------------------------------
     # Scheduler execution
@@ -1380,7 +1458,10 @@ class SimulationEngine:
         sim_date = config.get("sim_start_date", datetime.now().date())
         self.start_time = self._day_start(sim_date)
         self._reset_for_run()
-        self._apply_staff_absence(config["num_absent_staff"])
+        self._apply_staff_absence(
+            config.get("num_absent_staff", 0),
+            config.get("absent_staff_ids", []),
+        )
 
         # Check if generated requests should be disabled
         disable_generated_requests = config.get("disable_generated_requests", False)

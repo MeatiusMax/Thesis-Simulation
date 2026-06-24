@@ -676,6 +676,11 @@ def build_api_payload() -> Dict:
     weights = normalized_weights_from_ui()
     manual_seed = int(st.session_state.manual_seed) if st.session_state.seed_mode == "Manual" else None
     scenario = "peak_period" if st.session_state.peak_mode else "baseline"
+
+    absent_staff_ids = []
+    if st.session_state.enable_absence:
+        absent_staff_ids = st.session_state.get("absent_staff_ids", [])
+
     return {
         "scheduler_type": st.session_state.scheduler_type,
         "allocator_type": st.session_state.allocator_type,
@@ -685,13 +690,14 @@ def build_api_payload() -> Dict:
         "urgency_base": 8 if st.session_state.peak_mode else 5,
         "imbalance_factor": int(st.session_state.imbalance_factor),
         "num_absent_staff": int(st.session_state.num_absent_staff) if st.session_state.enable_absence else 0,
+        "absent_staff_ids": absent_staff_ids,
         "random_seed": manual_seed,
         "work_start": st.session_state.work_start_time.strftime("%H:%M"),
         "work_end": st.session_state.work_end_time.strftime("%H:%M"),
         "priority_weights": weights,
         "scenario": scenario,
         "urgency": bool(st.session_state.urgency),
-        "disable_generated_requests": bool(st.session_state.get("disable_generated_requests", False))
+        "disable_generated_requests": bool(st.session_state.get("disable_generated_requests", False)),
     }
 
 
@@ -1134,7 +1140,7 @@ def build_variant_summary_chart(compare_df: pd.DataFrame, title: str = "Summary 
 
 def routing_events(event_log: List[Dict]) -> List[Dict]:
     """Keep only request-routing decisions for request-by-request playback."""
-    decision_types = {"ASSIGN", "WAITING"}
+    decision_types = {"QUEUE", "ASSIGN", "WAITING"}
     return [event for event in event_log if event.get("event_type") in decision_types]
 
 
@@ -1143,9 +1149,11 @@ def playback_state(decisions: List[Dict], step: int) -> Dict:
         return {
             "current_event": None,
             "assignments": [],
+            "queued": [],
             "waiting": [],
             "processed_count": 0,
             "assigned_count": 0,
+            "queue_count": 0,
             "waiting_count": 0,
             "staff_flow": {},
         }
@@ -1154,42 +1162,55 @@ def playback_state(decisions: List[Dict], step: int) -> Dict:
     chunk = decisions[: step + 1]
 
     assignments = []
+    queued = []
     waiting = []
     staff_flow: Dict[str, List[str]] = {}
 
     for item in chunk:
         kind = item.get("event_type")
-        if kind == "ASSIGN":
-            assignments.append(
-                {
-                    "Time": item.get("time"),
-                    "Request": item.get("request_id"),
-                    "College": item.get("college"),
-                    "Staff": item.get("staff_id"),
-                    "Priority Score": item.get("priority_score", 0.0),
-                    "Queue Wait (h)": item.get("queue_wait_hours", "-"),
-                    "Mode": humanize_event_text(item.get("details", "")),
-                }
-            )
+
+        if kind == "QUEUE":
+            queued.append({
+                "Time": item.get("time"),
+                "Request": item.get("request_id"),
+                "College": item.get("college"),
+                "Priority Score": item.get("priority_score", 0.0),
+                "Reason": humanize_event_text(item.get("details", "")),
+                "Assigned At": item.get("assigned_at"),
+                "Queue Wait (h)": item.get("queue_wait_hours", "-"),
+            })
+
+        elif kind == "ASSIGN":
+            assignments.append({
+                "Time": item.get("time"),
+                "Request": item.get("request_id"),
+                "College": item.get("college"),
+                "Staff": item.get("staff_id"),
+                "Priority Score": item.get("priority_score", 0.0),
+                "Queue Wait (h)": item.get("queue_wait_hours", "-"),
+                "Mode": humanize_event_text(item.get("details", "")),
+            })
+
             staff_key = item.get("staff_id") or "UNASSIGNED"
             staff_flow.setdefault(staff_key, []).append(item.get("request_id"))
+
         elif kind == "WAITING":
-            waiting.append(
-                {
-                    "Time": item.get("time"),
-                    "Request": item.get("request_id"),
-                    "College": item.get("college"),
-                    "Priority Score": item.get("priority_score", 0.0),
-                    "Reason": humanize_event_text(item.get("details", "")),
-                }
-            )
+            waiting.append({
+                "Time": item.get("time"),
+                "Request": item.get("request_id"),
+                "College": item.get("college"),
+                "Priority Score": item.get("priority_score", 0.0),
+                "Reason": humanize_event_text(item.get("details", "")),
+            })
 
     return {
         "current_event": chunk[-1],
         "assignments": assignments,
+        "queued": queued,
         "waiting": waiting,
         "processed_count": len(chunk),
         "assigned_count": len(assignments),
+        "queue_count": len(queued),
         "waiting_count": len(waiting),
         "staff_flow": staff_flow,
     }
@@ -1639,12 +1660,17 @@ def render_playback_section(results, engine):
     st.header("Playback")
 
     event_log = results.get("event_log", [])
-    
-    # 2. Cache decisions filtering in st.session_state
-    run_key = (results.get("seed_used"), results.get("scheduler_type"), results.get("allocator_type"))
+
+    run_key = (
+        results.get("seed_used"),
+        results.get("scheduler_type"),
+        results.get("allocator_type"),
+    )
+
     if st.session_state.get("cached_decisions_run_key") != run_key:
         st.session_state.decisions = routing_events(event_log)
         st.session_state.cached_decisions_run_key = run_key
+
     decisions = st.session_state.decisions
 
     if not decisions:
@@ -1653,7 +1679,10 @@ def render_playback_section(results, engine):
 
     max_step = len(decisions) - 1
     st.session_state.playback_frame = min(st.session_state.playback_frame, max_step)
-    st.session_state.playback_frame_ui = min(max(st.session_state.playback_frame_ui, 1), max_step + 1)
+    st.session_state.playback_frame_ui = min(
+        max(st.session_state.playback_frame_ui, 1),
+        max_step + 1,
+    )
 
     force_slider_sync = False
 
@@ -1661,16 +1690,20 @@ def render_playback_section(results, engine):
 
     if controls_col1.button("▶ Play", use_container_width=True):
         st.session_state.playback_playing = True
+
     if controls_col2.button("⏸ Pause", use_container_width=True):
         st.session_state.playback_playing = False
+
     if controls_col3.button("◀ Step", use_container_width=True):
         st.session_state.playback_playing = False
         st.session_state.playback_frame = max(0, st.session_state.playback_frame - 1)
         force_slider_sync = True
+
     if controls_col4.button("Step ▶", use_container_width=True):
         st.session_state.playback_playing = False
         st.session_state.playback_frame = min(max_step, st.session_state.playback_frame + 1)
         force_slider_sync = True
+
     if controls_col5.button("⏭ End", use_container_width=True):
         st.session_state.playback_playing = False
         st.session_state.playback_frame = max_step
@@ -1678,7 +1711,6 @@ def render_playback_section(results, engine):
 
     controls_col6.selectbox("Speed", list(SPEED_OPTIONS.keys()), key="playback_speed")
 
-    # Sync slider only after programmatic changes (buttons/autoplay), not on user drags.
     if force_slider_sync or (
         st.session_state.playback_playing
         and st.session_state.playback_frame_ui != st.session_state.playback_frame
@@ -1696,7 +1728,6 @@ def render_playback_section(results, engine):
     frame_data = playback_state(decisions, st.session_state.playback_frame)
     current_event = frame_data["current_event"]
 
-    # 1. Cache request_lookup with pre-parsed submission times
     if st.session_state.get("cached_request_lookup_run_key") != run_key:
         lookup = {}
         for request_item in results.get("generated_requests", []):
@@ -1705,12 +1736,15 @@ def render_playback_section(results, engine):
                 sub_raw = req_copy.get("submission_time")
                 req_copy["_submission_time_parsed"] = parse_event_time(sub_raw) if sub_raw else None
                 lookup[req_copy["request_id"]] = req_copy
+
         st.session_state.request_lookup = lookup
         st.session_state.cached_request_lookup_run_key = run_key
+
     request_lookup = st.session_state.request_lookup
 
     staff_rows: Dict[str, List[Dict]] = {}
     staff_meta: Dict[str, Dict] = {}
+
     for staff in engine.staff_pool:
         staff_rows[staff.staff_id] = []
         staff_meta[staff.staff_id] = {
@@ -1718,67 +1752,83 @@ def render_playback_section(results, engine):
             "quota": staff.quota_limit,
         }
 
-    # 3. Pre-parse assignment datetime (_dt) and date (_date) inside loop
-    for assignment in frame_data["assignments"]:
+    for assignment in frame_data.get("assignments", []):
         staff_id = assignment.get("Staff") or "UNASSIGNED"
         request_id = assignment.get("Request")
         request_meta = request_lookup.get(request_id, {})
-        priority_score = request_meta.get("priority_score", assignment.get("Priority Score", 0.0))
+        priority_score = request_meta.get(
+            "priority_score",
+            assignment.get("Priority Score", 0.0),
+        )
 
         if staff_id not in staff_rows:
             staff_rows[staff_id] = []
-            staff_meta[staff_id] = {"college": "-", "quota": None}
+            staff_meta[staff_id] = {
+                "college": "-",
+                "quota": None,
+            }
 
         is_custom_req = request_meta.get("is_custom", False)
         req_display = f"⭐ {request_id}" if is_custom_req else request_id
 
-        # Pre-parse Assigned At time
         assigned_at_raw = assignment.get("Time")
         assigned_at_dt = parse_event_time(str(assigned_at_raw)) if assigned_at_raw else None
         assigned_at_date = assigned_at_dt.date() if assigned_at_dt else None
 
-        staff_rows[staff_id].append(
-            {
-                "Request": req_display,
-                "College": request_meta.get("college", assignment.get("College")),
-                "Document": request_meta.get("document_type", "-"),
-                "Priority Score": round(float(priority_score or 0.0), 4),
-                "Queue Wait (h)": assignment.get("Queue Wait (h)"),
-                "Assigned At": assignment.get("Time"),
-                "_dt": assigned_at_dt,
-                "_date": assigned_at_date,
-            }
-        )
+        staff_rows[staff_id].append({
+            "Request": req_display,
+            "College": request_meta.get("college", assignment.get("College")),
+            "Document": request_meta.get("document_type", "-"),
+            "Priority Score": round(float(priority_score or 0.0), 4),
+            "Queue Wait (h)": assignment.get("Queue Wait (h)"),
+            "Assigned At": assignment.get("Time"),
+            "_dt": assigned_at_dt,
+            "_date": assigned_at_date,
+        })
 
     assigned_request_ids = {
-        assignment.get("Request")
-        for assignment in frame_data["assignments"]
+        str(assignment.get("Request", "")).strip()
+        for assignment in frame_data.get("assignments", [])
         if assignment.get("Request")
     }
 
     waiting_rows = []
-    for waiting_item in frame_data["waiting"]:
-        request_id = waiting_item.get("Request")
+
+    for waiting_item in frame_data.get("waiting", []):
+        request_id = str(waiting_item.get("Request", "")).strip()
+
+        if not request_id:
+            continue
+
         if request_id in assigned_request_ids:
             continue
+
         request_meta = request_lookup.get(request_id, {})
         event_time_raw = waiting_item.get("Time")
-        
+
         is_custom_req = request_meta.get("is_custom", False)
         req_display = f"⭐ {request_id}" if is_custom_req else request_id
-        
-        waiting_rows.append(
-            {
-                "Request": req_display,
-                "College": request_meta.get("college", waiting_item.get("College")),
-                "Document": request_meta.get("document_type", "-"),
-                "Priority Score": round(float(request_meta.get("priority_score", waiting_item.get("Priority Score", 0.0)) or 0.0), 4),
-                "Submitted": format_compact_datetime(request_meta.get("submission_time", "-")),
-                "Reason": waiting_item.get("Reason", ""),
-                "Event Time": format_compact_datetime(event_time_raw),
-                "_event_time": parse_event_time(str(event_time_raw)) if event_time_raw else datetime.min,
-            }
-        )
+
+        waiting_rows.append({
+            "Request": req_display,
+            "College": request_meta.get("college", waiting_item.get("College")),
+            "Document": request_meta.get("document_type", "-"),
+            "Priority Score": round(
+                float(
+                    request_meta.get(
+                        "priority_score",
+                        waiting_item.get("Priority Score", 0.0),
+                    ) or 0.0
+                ),
+                4,
+            ),
+            "Submitted": format_compact_datetime(
+                request_meta.get("submission_time", "-")
+            ),
+            "Reason": waiting_item.get("Reason", ""),
+            "Event Time": format_compact_datetime(event_time_raw),
+            "_event_time": parse_event_time(str(event_time_raw)) if event_time_raw else datetime.min,
+        })
 
     is_weighted_scheduler = results.get("scheduler_type") == "WEIGHTED"
     staff_college_map = build_staff_college_map(engine.staff_pool)
@@ -1794,40 +1844,41 @@ def render_playback_section(results, engine):
     if current_event:
         current_time = parse_event_time(current_event.get("time", ""))
 
-        routed_request_ids = set()
-        for assign_item in frame_data["assignments"]:
-            if assign_item.get("Request"):
-                routed_request_ids.add(assign_item["Request"])
-
-        # Optimize pending queue loop using pre-parsed submission times
         pending_queue_rows = []
-        for request_id, request_meta in request_lookup.items():
-            submission_time = request_meta.get("_submission_time_parsed")
-            if not submission_time:
+
+        for queue_item in frame_data.get("queued", []):
+            request_id = str(queue_item.get("Request", "")).strip()
+
+            if not request_id:
                 continue
-            if submission_time <= current_time and request_id not in routed_request_ids:
-                is_custom_req = request_meta.get("is_custom", False)
-                req_display = f"⭐ {request_id}" if is_custom_req else request_id
-                pending_queue_rows.append(
-                    {
-                        "Request": req_display,
-                        "College": request_meta.get("college", "-"),
-                        "Document": request_meta.get("document_type", "-"),
-                        "Priority Score": round(float(request_meta.get("priority_score", 0.0) or 0.0), 4),
-                        "Submitted": format_compact_datetime(request_meta.get("submission_time")),
-                        "Pending Wait (h)": round((current_time - submission_time).total_seconds() / 3600.0, 2),
-                        "_sort_submission": submission_time,
-                    }
-                )
+
+            if request_id in assigned_request_ids:
+                continue
+
+            request_meta = request_lookup.get(request_id, {})
+            is_custom_req = request_meta.get("is_custom", False)
+            req_display = f"⭐ {request_id}" if is_custom_req else request_id
+
+            pending_queue_rows.append({
+                "Request": req_display,
+                "College": request_meta.get("college", queue_item.get("College", "-")),
+                "Document": request_meta.get("document_type", "-"),
+                "Priority Score": round(float(queue_item.get("Priority Score", 0.0) or 0.0), 4),
+                "Submitted": format_compact_datetime(request_meta.get("submission_time")),
+                "Reason": queue_item.get("Reason", "Quota Or Slot Waiting"),
+                "Assigned At": format_compact_datetime(queue_item.get("Assigned At")),
+                "Pending Wait (h)": queue_item.get("Queue Wait (h)", "-"),
+            })
 
         if is_weighted_scheduler:
             pending_queue_rows.sort(
-                key=lambda row: (-float(row.get("Priority Score", 0.0)), row["_sort_submission"])
+                key=lambda row: (
+                    -float(row.get("Priority Score", 0.0)),
+                    str(row.get("Submitted", "")),
+                )
             )
         else:
-            pending_queue_rows.sort(key=lambda row: row["_sort_submission"])
-        for row in pending_queue_rows:
-            row.pop("_sort_submission", None)
+            pending_queue_rows.sort(key=lambda row: str(row.get("Submitted", "")))
 
         card1, card2, card3, card4, card5 = st.columns([1.6, 1, 1, 1, 1])
         card1.metric("Simulation Clock", current_time.strftime("%Y-%m-%d %H:%M"))
@@ -1851,16 +1902,18 @@ def render_playback_section(results, engine):
         quota_enforced = results.get("allocator_type") != "quota_free"
         current_day = current_time.date()
         capacity_rows = []
+
         for staff in engine.staff_pool:
             rows_for_staff = staff_rows.get(staff.staff_id, [])
             total_assigned = len(rows_for_staff)
             assigned_today = 0
-            # 4. Use pre-parsed date object (_date) instead of parse_event_time
+
             for row in rows_for_staff:
                 if row.get("_date") == current_day:
                     assigned_today += 1
 
             quota_value = staff.quota_limit if quota_enforced else None
+
             row = {
                 "Staff ID": staff.staff_id,
                 "Staff": format_staff_label(staff.staff_id, staff_college_map),
@@ -1868,20 +1921,27 @@ def render_playback_section(results, engine):
                 "Assigned Today": assigned_today,
                 "Total Assigned": total_assigned,
             }
+
             if quota_enforced:
                 row["Quota/Day"] = quota_value
                 row["Today Fill %"] = round((assigned_today / max(quota_value, 1)) * 100.0, 1)
+
             capacity_rows.append(row)
 
         capacity_df = pd.DataFrame(capacity_rows)
+
         assigned_today_map = {
-            row["Staff ID"]: row["Assigned Today"] for row in capacity_rows
+            row["Staff ID"]: row["Assigned Today"]
+            for row in capacity_rows
         }
+
         total_assigned_map = {
-            row["Staff ID"]: row["Total Assigned"] for row in capacity_rows
+            row["Staff ID"]: row["Total Assigned"]
+            for row in capacity_rows
         }
 
         fig_capacity = go.Figure()
+
         fig_capacity.add_trace(
             go.Bar(
                 name="Assigned Today",
@@ -1892,6 +1952,7 @@ def render_playback_section(results, engine):
                 textposition="outside",
             )
         )
+
         if quota_enforced:
             fig_capacity.add_trace(
                 go.Bar(
@@ -1912,20 +1973,24 @@ def render_playback_section(results, engine):
             barmode="group",
             height=360,
         )
+
         apply_plot_theme(fig_capacity)
-        # 5. Pass config={"staticPlot": True} to optimize chart rendering during playback
         st.plotly_chart(fig_capacity, use_container_width=True, config={"staticPlot": True})
 
         st.subheader("Live Staff Request Lists")
+
         ordered_staff_ids = [staff.staff_id for staff in engine.staff_pool]
+
         for idx in range(0, len(ordered_staff_ids), 3):
             row_ids = ordered_staff_ids[idx: idx + 3]
             row_cols = st.columns(3)
+
             for col, staff_id in zip(row_cols, row_ids):
                 with col:
                     meta = staff_meta.get(staff_id, {"college": "-", "quota": None})
                     assigned_today = assigned_today_map.get(staff_id, 0)
                     total_assigned = total_assigned_map.get(staff_id, 0)
+
                     if quota_enforced and meta.get("quota") is not None:
                         quota_value = int(meta["quota"])
                         st.metric(
@@ -1933,6 +1998,7 @@ def render_playback_section(results, engine):
                             f"{assigned_today}/{quota_value}",
                             delta=f"Total {total_assigned}",
                         )
+
                         if assigned_today >= quota_value:
                             st.warning("Quota full at this step")
                     else:
@@ -1942,6 +2008,7 @@ def render_playback_section(results, engine):
                         )
 
                     rows = staff_rows.get(staff_id, [])
+
                     if rows:
                         display_rows = staff_rows_with_day_separators(rows)
                         render_theme_table(pd.DataFrame(display_rows), height_px=340)
@@ -1952,14 +2019,14 @@ def render_playback_section(results, engine):
         wait_col1, wait_col2 = st.columns(2)
 
         with wait_col1:
-            st.caption("Pending Queue: requests already arrived but still waiting for a slot.")
+            st.caption("Pending Queue: ready requests waiting for quota/slot availability.")
             if pending_queue_rows:
                 render_theme_table(pd.DataFrame(pending_queue_rows), height_px=320)
             else:
                 st.caption("No pending queue at this step.")
 
         with wait_col2:
-            st.caption("Unassignable Waiting List: requests that cannot be routed to any staff.")
+            st.caption("Unassignable Waiting List: requests that cannot be routed yet.")
             if waiting_rows:
                 waiting_display_rows = [
                     {k: v for k, v in row.items() if not str(k).startswith("_")}
